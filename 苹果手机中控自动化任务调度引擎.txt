@@ -1,0 +1,64 @@
+# task_engine.py
+import time
+import random
+import threading
+import traceback
+from datetime import datetime
+
+class TaskEngine:
+    def __init__(self, controllers, max_workers=20):
+        self.controllers = controllers  # {udid: DeviceController}
+        self.max_workers = max_workers
+        self.running_tasks = {}
+
+    def run_task_on_device(self, udid, task_script, jitter=2.0):
+        """在单台设备上执行任务脚本，task_script是一个接收controller的函数"""
+        ctrl = self.controllers.get(udid)
+        if not ctrl:
+            return {"udid": udid, "status": "offline"}
+        try:
+            # 随机延迟，避免所有设备同时动作
+            time.sleep(random.uniform(0.1, jitter))
+            task_script(ctrl)
+            return {"udid": udid, "status": "success",
+                    "time": datetime.now().isoformat()}
+        except Exception as e:
+            return {"udid": udid, "status": "failed",
+                    "error": str(e),
+                    "trace": traceback.format_exc()}
+
+    def broadcast_task(self, task_script, device_udids=None):
+        """把同一个任务广播到所有或指定设备"""
+        udids = device_udids or list(self.controllers.keys())
+        results = []
+        threads = []
+        def worker(udid):
+            res = self.run_task_on_device(udid, task_script)
+            results.append(res)
+        for udid in udids:
+            t = threading.Thread(target=worker, args=(udid,))
+            threads.append(t)
+            t.start()
+            # 控制并发数
+            if len(threads) >= self.max_workers:
+                for t in threads:
+                    t.join()
+                threads.clear()
+        for t in threads:
+            t.join()
+        ok = sum(1 for r in results if r["status"] == "success")
+        print(f"任务完成：{ok}/{len(results)} 成功")
+        return results
+
+# 示例：在所有设备上打开抖音并滑动三次
+def douyin_watch_task(ctrl):
+    ctrl.launch_app("com.ss.iphone.ugc.Aweme")
+    time.sleep(random.uniform(5, 8))
+    for i in range(3):
+        ctrl.swipe(200, 600, 200, 200, duration=random.uniform(0.3, 0.6))
+        time.sleep(random.uniform(8, 15))
+
+if __name__ == "__main__":
+    # engine = TaskEngine(controllers_dict)
+    # engine.broadcast_task(douyin_watch_task)
+    pass
