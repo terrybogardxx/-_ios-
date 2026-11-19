@@ -1,0 +1,366 @@
+# ios_multi_control.py
+# 运行环境：macOS + Appium 2 + XCUITest Driver + libimobiledevice
+# 功能：多台 iPhone 设备发现、Appium 连接、截图、点击、滑动、输入、启动 App、多屏网格显示
+
+from __future__ import annotations
+
+import argparse
+import io
+import os
+import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import tkinter as tk
+from PIL import Image, ImageTk
+
+from appium import webdriver
+from appium.options.ios import XCUITestOptions
+
+IDEVICE_ID = os.environ.get("IDEVICE_ID", "idevice_id")
+IDEVICEINFO = os.environ.get("IDEVICEINFO", "ideviceinfo")
+IDEVICESCREENSHOT = os.environ.get("IDEVICESCREENSHOT", "idevicescreenshot")
+IDEVICEINSTALLER = os.environ.get("IDEVICEINSTALLER", "ideviceinstaller")
+
+
+def run_cmd(cmd: List[str], timeout: float = 30.0) -> Tuple[int, str, str]:
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+@dataclass
+class IOSDeviceInfo:
+    udid: str
+    name: str = ""
+    model: str = ""
+    version: str = ""
+
+
+def list_ios_udids() -> List[str]:
+    code, out, err = run_cmd([IDEVICE_ID, "-l"], timeout=15)
+    if code != 0:
+        raise RuntimeError(
+            f"idevice_id 执行失败：{err.strip()}\n"
+            "请确认已安装 libimobiledevice，并且 iPhone 已信任电脑。"
+        )
+    return [x.strip() for x in out.splitlines() if x.strip()]
+
+
+def get_ios_info(udid: str) -> IOSDeviceInfo:
+    def info(key: str, default: str = "") -> str:
+        code, out, err = run_cmd([IDEVICEINFO, "-u", udid, "-k", key], timeout=15)
+        return out.strip() if code == 0 else default
+
+    return IOSDeviceInfo(
+        udid=udid,
+        name=info("DeviceName", udid),
+        model=info("ProductType", ""),
+        version=info("ProductVersion", ""),
+    )
+
+
+def list_ios_devices() -> List[IOSDeviceInfo]:
+    return [get_ios_info(udid) for udid in list_ios_udids()]
+
+
+class IOSDevice:
+    """负责不依赖 Appium 的底层操作：截图、安装 IPA、设备信息。"""
+
+    def __init__(self, info: IOSDeviceInfo):
+        self.info = info
+        self.udid = info.udid
+
+    def screenshot_native(self, path: str) -> str:
+        """使用 idevicescreenshot 截图，适合只做监控/巡检。"""
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        code, out, err = run_cmd([IDEVICESCREENSHOT, "-u", self.udid, path], timeout=30)
+        if code != 0:
+            raise RuntimeError(f"[{self.udid}] idevicescreenshot 失败：{err.strip() or out.strip()}")
+        return path
+
+    def install_ipa(self, ipa_path: str) -> str:
+        code, out, err = run_cmd(
+            [IDEVICEINSTALLER, "-u", self.udid, "-i", ipa_path],
+            timeout=300,
+        )
+        if code != 0:
+            raise RuntimeError(f"[{self.udid}] 安装失败：{err.strip() or out.strip()}")
+        return out.strip()
+
+
+class AppiumController:
+    """一台 iPhone 对应一个 Appium 会话。"""
+
+    def __init__(
+        self,
+        info: IOSDeviceInfo,
+        appium_url: str,
+        bundle_id: Optional[str],
+        wda_port: int,
+        mjpeg_port: int,
+    ):
+        self.info = info
+        self.udid = info.udid
+        self.appium_url = appium_url
+        self.bundle_id = bundle_id
+        self.wda_port = wda_port
+        self.mjpeg_port = mjpeg_port
+        self.driver: Optional[webdriver.Remote] = None
+
+    def connect(self) -> None:
+        opts = XCUITestOptions()
+        opts.set_capability("platformName", "iOS")
+        opts.set_capability("automationName", "XCUITest")
+        opts.set_capability("deviceName", self.info.name or self.info.model or "iPhone")
+        opts.set_capability("udid", self.udid)
+        opts.set_capability("noReset", True)
+        opts.set_capability("newCommandTimeout", 300)
+        opts.set_capability("wdaLocalPort", self.wda_port)
+        opts.set_capability("mjpegServerPort", self.mjpeg_port)
+        opts.set_capability("shouldUseSingletonTestManager", False)
+        opts.set_capability("useNewWDA", False)
+
+        if self.bundle_id:
+            opts.set_capability("bundleId", self.bundle_id)
+
+        self.driver = webdriver.Remote(self.appium_url, options=opts)
+
+    def close(self) -> None:
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
+    def _require_driver(self):
+        if not self.driver:
+            raise RuntimeError(f"[{self.udid}] Appium 尚未连接")
+        return self.driver
+
+    def screen_size(self) -> Tuple[int, int]:
+        d = self._require_driver().get_window_size()
+        return int(d["width"]), int(d["height"])
+
+    def screenshot(self) -> bytes:
+        return self._require_driver().get_screenshot_as_png()
+
+    def tap(self, x: int, y: int) -> None:
+        self._require_driver().execute_script("mobile: tap", {"x": int(x), "y": int(y)})
+
+    def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_s: float = 0.3) -> None:
+        self._require_driver().execute_script(
+            "mobile: dragFromToForDuration",
+            {
+                "fromX": int(x1),
+                "fromY": int(y1),
+                "toX": int(x2),
+                "toY": int(y2),
+                "duration": float(duration_s),
+            },
+        )
+
+    def long_press(self, x: int, y: int, duration_s: float = 0.8) -> None:
+        self.swipe(x, y, x, y, duration_s)
+
+    def input_text(self, text: str) -> None:
+        """向当前焦点输入文本。需要先点击输入框。"""
+        self._require_driver().switch_to.active_element.send_keys(text)
+
+    def launch_app(self, bundle_id: Optional[str] = None) -> None:
+        bid = bundle_id or self.bundle_id
+        if not bid:
+            raise ValueError("未指定 bundleId")
+        self._require_driver().execute_script("mobile: launchApp", {"bundleId": bid})
+
+    def terminate_app(self, bundle_id: Optional[str] = None) -> None:
+        bid = bundle_id or self.bundle_id
+        if not bid:
+            raise ValueError("未指定 bundleId")
+        self._require_driver().execute_script("mobile: terminateApp", {"bundleId": bid})
+
+    def home(self) -> None:
+        self._require_driver().execute_script("mobile: pressButton", {"name": "home"})
+
+
+class MultiIOSController:
+    def __init__(self, appium_url: str, bundle_id: Optional[str] = None):
+        self.appium_url = appium_url
+        self.bundle_id = bundle_id
+        self.devices: List[IOSDeviceInfo] = []
+        self.controllers: Dict[str, AppiumController] = {}
+
+    def refresh_devices(self) -> List[IOSDeviceInfo]:
+        self.devices = list_ios_devices()
+        return self.devices
+
+    def connect_all(self) -> None:
+        if not self.devices:
+            self.refresh_devices()
+
+        for i, info in enumerate(self.devices):
+            ctrl = AppiumController(
+                info=info,
+                appium_url=self.appium_url,
+                bundle_id=self.bundle_id,
+                wda_port=8100 + i,
+                mjpeg_port=9100 + i,
+            )
+            ctrl.connect()
+            self.controllers[info.udid] = ctrl
+            print(f"[OK] 已连接 {info.name} / {info.udid}，WDA 端口 {8100 + i}")
+
+    def close_all(self) -> None:
+        for c in self.controllers.values():
+            c.close()
+        self.controllers.clear()
+
+    def broadcast(self, func_name: str, *args, **kwargs) -> Dict[str, object]:
+        """把同一个方法并发下发到所有已连接设备。"""
+        results: Dict[str, object] = {}
+
+        def call(ctrl: AppiumController):
+            return getattr(ctrl, func_name)(*args, **kwargs)
+
+        with ThreadPoolExecutor(max_workers=max(1, len(self.controllers))) as ex:
+            futures = {ex.submit(call, c): udid for udid, c in self.controllers.items()}
+            for fut in as_completed(futures):
+                udid = futures[fut]
+                try:
+                    results[udid] = fut.result()
+                except Exception as e:
+                    results[udid] = e
+        return results
+
+
+class MultiScreenDashboard:
+    """简单的多设备屏幕网格：轮询 Appium 截图显示，点击画布转发为设备点击。"""
+
+    def __init__(self, mc: MultiIOSController, cell_w: int = 300, cell_h: int = 600, interval_ms: int = 1500):
+        self.mc = mc
+        self.cell_w = cell_w
+        self.cell_h = cell_h
+        self.interval_ms = interval_ms
+        self.root = tk.Tk()
+        self.root.title("iOS 多设备屏幕调度")
+        self.canvases: Dict[str, tk.Canvas] = {}
+        self.images: Dict[str, ImageTk.PhotoImage] = {}
+        self.screen_sizes: Dict[str, Tuple[int, int]] = {}
+        self._build()
+
+    def _build(self):
+        for idx, (udid, ctrl) in enumerate(self.mc.controllers.items()):
+            frame = tk.Frame(self.root)
+            frame.grid(row=idx // 3, column=idx % 3, padx=6, pady=6)
+            label = tk.Label(frame, text=f"{ctrl.info.name}\n{udid}")
+            label.pack()
+            canvas = tk.Canvas(frame, width=self.cell_w, height=self.cell_h, bg="black")
+            canvas.pack()
+            canvas.bind("<Button-1>", lambda e, u=udid: self._on_click(u, e))
+            self.canvases[udid] = canvas
+            try:
+                self.screen_sizes[udid] = ctrl.screen_size()
+            except Exception:
+                self.screen_sizes[udid] = (1170, 2532)
+
+    def _on_click(self, udid: str, event):
+        ctrl = self.mc.controllers[udid]
+        sw, sh = self.screen_sizes[udid]
+        x = int(event.x / self.cell_w * sw)
+        y = int(event.y / self.cell_h * sh)
+        threading.Thread(target=ctrl.tap, args=(x, y), daemon=True).start()
+
+    def _refresh(self):
+        for udid, ctrl in self.mc.controllers.items():
+            try:
+                png = ctrl.screenshot()
+                img = Image.open(io.BytesIO(png)).convert("RGB")
+                self.screen_sizes[udid] = img.size
+                img = img.resize((self.cell_w, self.cell_h))
+                photo = ImageTk.PhotoImage(img)
+                canvas = self.canvases[udid]
+                canvas.delete("all")
+                canvas.create_image(0, 0, anchor="nw", image=photo)
+                self.images[udid] = photo
+            except Exception as e:
+                canvas = self.canvases[udid]
+                canvas.delete("all")
+                canvas.create_text(10, 10, anchor="nw", fill="red", text=f"截图失败：{e}")
+        self.root.after(self.interval_ms, self._refresh)
+
+    def run(self):
+        self.root.after(200, self._refresh)
+        self.root.mainloop()
+
+
+def cmd_list():
+    for d in list_ios_devices():
+        print(f"{d.udid}\t{d.name}\t{d.model}\t{d.version}")
+
+
+def cmd_screenshot(outdir: str):
+    os.makedirs(outdir, exist_ok=True)
+    for d in list_ios_devices():
+        dev = IOSDevice(d)
+        path = os.path.join(outdir, f"{d.udid}.png")
+        dev.screenshot_native(path)
+        print(f"[OK] {d.name} -> {path}")
+
+
+def cmd_install(ipa: str):
+    for d in list_ios_devices():
+        dev = IOSDevice(d)
+        print(f"[...] 安装到 {d.name}")
+        print(dev.install_ipa(ipa))
+
+
+def cmd_dashboard(appium_url: str, bundle_id: Optional[str]):
+    mc = MultiIOSController(appium_url=appium_url, bundle_id=bundle_id)
+    mc.refresh_devices()
+    if not mc.devices:
+        print("未发现 iOS 设备")
+        return
+    mc.connect_all()
+    try:
+        MultiScreenDashboard(mc).run()
+    finally:
+        mc.close_all()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="iOS 多设备调度工具")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", help="列出 iOS 设备")
+
+    p_shot = sub.add_parser("screenshot", help="批量原生截图")
+    p_shot.add_argument("--outdir", default="./ios_screenshots")
+
+    p_ins = sub.add_parser("install", help="批量安装 IPA")
+    p_ins.add_argument("--ipa", required=True)
+
+    p_dash = sub.add_parser("dashboard", help="启动 Appium 多屏网格")
+    p_dash.add_argument("--appium-url", default="http://127.0.0.1:4723")
+    p_dash.add_argument("--bundle-id", default=None)
+
+    args = parser.parse_args()
+    if args.cmd == "list":
+        cmd_list()
+    elif args.cmd == "screenshot":
+        cmd_screenshot(args.outdir)
+    elif args.cmd == "install":
+        cmd_install(args.ipa)
+    elif args.cmd == "dashboard":
+        cmd_dashboard(args.appium_url, args.bundle_id)
+
+
+if __name__ == "__main__":
+    main()
